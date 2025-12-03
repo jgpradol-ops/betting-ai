@@ -1,0 +1,224 @@
+from flask import Flask, jsonify, request
+from datetime import datetime, timedelta
+import sqlite3
+import json
+import os
+from functools import wraps
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Database setup
+DB_FILE = 'betting_ai.db'
+
+def init_db():
+    """Initialize database with picks table"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS picks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha_evento TEXT NOT NULL,
+            fecha_analisis TEXT NOT NULL,
+            deporte TEXT NOT NULL,
+            evento TEXT NOT NULL,
+            equipo_local TEXT NOT NULL,
+            equipo_visitante TEXT NOT NULL,
+            cuota REAL NOT NULL,
+            prediccion REAL NOT NULL,
+            confianza REAL NOT NULL,
+            ev REAL NOT NULL,
+            estado TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Initialize database
+init_db()
+
+def validate_date(date_string):
+    """Validate and parse date string"""
+    try:
+        event_date = datetime.fromisoformat(date_string.replace('Z', '+00:00'))
+        now = datetime.now()
+        diff_hours = (event_date - now).total_seconds() / 3600
+        
+        if diff_hours < 48:
+            return False, "Evento debe ser en más de 48 horas"
+        if diff_hours > 720:  # 30 days
+            return False, "Evento debe ser dentro de 30 días"
+        return True, None
+    except:
+        return False, "Formato de fecha inválido"
+
+def ml_ensemble_predict(evento_data):
+    """Simulate ML ensemble prediction"""
+    import random
+    
+    # Simulated predictions from 3 models
+    xgb_pred = random.uniform(0.3, 0.7)
+    lgb_pred = random.uniform(0.3, 0.7)
+    nn_pred = random.uniform(0.3, 0.7)
+    
+    # Average ensemble
+    ensemble_pred = (xgb_pred * 0.35 + lgb_pred * 0.35 + nn_pred * 0.30)
+    confianza = min(0.95, abs(xgb_pred - lgb_pred) + abs(lgb_pred - nn_pred)) * 0.5 + 0.75
+    
+    return ensemble_pred, confianza
+
+def calculate_ev(prediction, cuota):
+    """Calculate Expected Value"""
+    implied_prob = 1 / cuota
+    ev = (prediction * cuota - 1) / cuota
+    return ev
+
+def get_recommendation(ev, confianza):
+    """Get recommendation based on EV and confidence"""
+    if ev > 0.05 and confianza > 0.80:
+        return "🟢 FUERTE - APOSTAR"
+    elif ev > 0.01 and confianza > 0.75:
+        return "🟡 MEDIA - CONSIDERAR"
+    else:
+        return "🔴 DÉBIL - EVITAR"
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "version": "6.2",
+        "timestamp": datetime.now().isoformat()
+    }), 200
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze_event():
+    """Analyze sports event and generate pick"""
+    try:
+        data = request.get_json()
+        
+        # Validate required fields
+        required = ['evento', 'equipo_local', 'equipo_visitante', 'deporte', 'fecha', 'cuota']
+        if not all(k in data for k in required):
+            return jsonify({"error": "Campos requeridos faltantes"}), 400
+        
+        # Validate date
+        valid, error = validate_date(data['fecha'])
+        if not valid:
+            return jsonify({"válido": False, "error": error}), 400
+        
+        # ML Ensemble prediction
+        prediccion, confianza = ml_ensemble_predict(data)
+        
+        # Calculate EV
+        ev = calculate_ev(prediccion, data['cuota'])
+        
+        # Get recommendation
+        recomendacion = get_recommendation(ev, confianza)
+        
+        # Determine state
+        estado = "VÁLIDO" if ev > 0 else "DÉBIL"
+        
+        # Save to database
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO picks 
+            (fecha_evento, fecha_analisis, deporte, evento, equipo_local, equipo_visitante, 
+             cuota, prediccion, confianza, ev, estado)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            data['fecha'],
+            datetime.now().isoformat(),
+            data['deporte'],
+            data['evento'],
+            data['equipo_local'],
+            data['equipo_visitante'],
+            data['cuota'],
+            prediccion,
+            confianza,
+            ev,
+            estado
+        ))
+        conn.commit()
+        pick_id = c.lastrowid
+        conn.close()
+        
+        return jsonify({
+            "válido": True,
+            "evento": data['evento'],
+            "prediccion": round(prediccion, 4),
+            "confianza": round(confianza, 4),
+            "ev": round(ev, 4),
+            "recomendacion": recomendacion,
+            "pick_id": pick_id
+        }), 201
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/picks', methods=['GET'])
+def get_picks():
+    """Get last 50 picks"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute('SELECT * FROM picks ORDER BY created_at DESC LIMIT 50')
+        picks = [dict(row) for row in c.fetchall()]
+        conn.close()
+        
+        return jsonify({
+            "total": len(picks),
+            "picks": picks
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Get global statistics"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        
+        c.execute('SELECT COUNT(*) as total FROM picks')
+        total = c.fetchone()[0]
+        
+        c.execute('SELECT COUNT(*) as validos FROM picks WHERE estado = "VÁLIDO"')
+        validos = c.fetchone()[0]
+        
+        c.execute('SELECT AVG(ev) as promedio_ev FROM picks')
+        promedio_ev = c.fetchone()[0] or 0
+        
+        c.execute('SELECT AVG(confianza) as promedio_confianza FROM picks')
+        promedio_confianza = c.fetchone()[0] or 0
+        
+        conn.close()
+        
+        return jsonify({
+            "total_picks": total,
+            "picks_validos": validos,
+            "picks_debiles": total - validos,
+            "promedio_ev": round(promedio_ev, 4),
+            "promedio_confianza": round(promedio_confianza, 4),
+            "tasa_acierto": round((validos / total * 100) if total > 0 else 0, 2)
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# CORS headers
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=True, host='0.0.0.0', port=port)
