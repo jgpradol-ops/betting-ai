@@ -1,2 +1,0 @@
-# betting-ai
-Apuestas 
