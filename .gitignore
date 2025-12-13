@@ -3,3 +3,4 @@ __pycache__/
 *.logmodels/*.pkl
 models/*.pkl
 models/*.pkl
+models/*.pkl
